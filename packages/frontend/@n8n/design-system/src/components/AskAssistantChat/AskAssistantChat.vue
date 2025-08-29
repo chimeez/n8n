@@ -1,25 +1,16 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 
-import BlockMessage from './messages/BlockMessage.vue';
-import CodeDiffMessage from './messages/CodeDiffMessage.vue';
-import ErrorMessage from './messages/ErrorMessage.vue';
-import EventMessage from './messages/EventMessage.vue';
-import TextMessage from './messages/TextMessage.vue';
-import ComposedNodesMessage from './messages/workflow/ComposedNodesMessage.vue';
-import RateWorkflowMessage from './messages/workflow/RateWorkflowMessage.vue';
-import WorkflowGeneratedMessage from './messages/workflow/WorkflowGeneratedMessage.vue';
-import WorkflowNodesMessage from './messages/workflow/WorkflowNodesMessage.vue';
-import WorkflowStepsMessage from './messages/workflow/WorkflowStepsMessage.vue';
+import MessageWrapper from './messages/MessageWrapper.vue';
 import { useI18n } from '../../composables/useI18n';
-import type { ChatUI } from '../../types/assistant';
+import type { ChatUI, RatingFeedback } from '../../types/assistant';
+import { isToolMessage } from '../../types/assistant';
 import AssistantIcon from '../AskAssistantIcon/AssistantIcon.vue';
 import AssistantLoadingMessage from '../AskAssistantLoadingMessage/AssistantLoadingMessage.vue';
 import AssistantText from '../AskAssistantText/AssistantText.vue';
 import InlineAskAssistantButton from '../InlineAskAssistantButton/InlineAskAssistantButton.vue';
 import N8nButton from '../N8nButton';
 import N8nIcon from '../N8nIcon';
-import N8nIconButton from '../N8nIconButton';
 
 const { t } = useI18n();
 
@@ -36,16 +27,18 @@ interface Props {
 	sessionId?: string;
 	title?: string;
 	placeholder?: string;
+	scrollOnNewMessage?: boolean;
+	showStop?: boolean;
+	maxLength?: number;
 }
 
 const emit = defineEmits<{
 	close: [];
+	stop: [];
 	message: [string, string?, boolean?];
 	codeReplace: [number];
 	codeUndo: [number];
-	thumbsUp: [];
-	thumbsDown: [];
-	submitFeedback: [string];
+	feedback: [RatingFeedback];
 }>();
 
 const onClose = () => emit('close');
@@ -59,11 +52,97 @@ const props = withDefaults(defineProps<Props>(), {
 	messages: () => [],
 	loadingMessage: undefined,
 	sessionId: undefined,
+	scrollOnNewMessage: false,
+});
+
+function normalizeMessages(messages: ChatUI.AssistantMessage[]): ChatUI.AssistantMessage[] {
+	return messages.map((msg, index) => ({
+		...msg,
+		id: msg.id || `msg-${index}`,
+		read: msg.read ?? true,
+	}));
+}
+
+function collapseToolMessages(messages: ChatUI.AssistantMessage[]): ChatUI.AssistantMessage[] {
+	const result: ChatUI.AssistantMessage[] = [];
+	let i = 0;
+
+	while (i < messages.length) {
+		const currentMsg = messages[i];
+
+		// If it's not a tool message, add it as-is and continue
+		if (!isToolMessage(currentMsg)) {
+			result.push(currentMsg);
+			i++;
+			continue;
+		}
+
+		// Collect consecutive tool messages with the same toolName
+		const toolMessagesGroup = [currentMsg];
+		let j = i + 1;
+
+		while (j < messages.length) {
+			const nextMsg = messages[j];
+			if (isToolMessage(nextMsg) && nextMsg.toolName === currentMsg.toolName) {
+				toolMessagesGroup.push(nextMsg);
+				j++;
+			} else {
+				break;
+			}
+		}
+
+		// If we have multiple tool messages with the same toolName, collapse them
+		if (toolMessagesGroup.length > 1) {
+			// Determine the status to show based on priority rules
+			const lastMessage = toolMessagesGroup[toolMessagesGroup.length - 1];
+			let titleSource = lastMessage;
+
+			// Check if we have running messages - if so, show the last running one and use its titles
+			const runningMessages = toolMessagesGroup.filter((msg) => msg.status === 'running');
+			const errorMessage = toolMessagesGroup.find((msg) => msg.status === 'error');
+			if (runningMessages.length > 0) {
+				const lastRunning = runningMessages[runningMessages.length - 1];
+				titleSource = lastRunning;
+			} else if (errorMessage) {
+				titleSource = errorMessage;
+			}
+
+			// Combine all updates from all tool messages
+			const combinedUpdates = toolMessagesGroup.flatMap((msg) => msg.updates || []);
+
+			// Create collapsed message with title logic based on final status
+			const collapsedMessage: ChatUI.ToolMessage = {
+				...lastMessage,
+				status: titleSource.status,
+				updates: combinedUpdates,
+				displayTitle: titleSource.displayTitle,
+				// Only set customDisplayTitle if status is running (for example "Adding X node")
+				customDisplayTitle:
+					titleSource.status === 'running' ? titleSource.customDisplayTitle : undefined,
+			};
+
+			result.push(collapsedMessage);
+		} else {
+			// Single tool message, add as-is
+			result.push(currentMsg);
+		}
+
+		i = j;
+	}
+
+	return result;
+}
+
+// Ensure all messages have required id and read properties, and collapse tool messages
+const normalizedMessages = computed(() => {
+	const normalized = normalizeMessages(props.messages);
+	return collapseToolMessages(normalized);
 });
 
 const textInputValue = ref<string>('');
 
 const chatInput = ref<HTMLTextAreaElement | null>(null);
+const messagesRef = ref<HTMLDivElement | null>(null);
 
 const sessionEnded = computed(() => {
 	return isEndOfSessionEvent(props.messages?.[props.messages.length - 1]);
@@ -101,17 +180,36 @@ function growInput() {
 	chatInput.value.style.height = `${Math.min(scrollHeight, MAX_CHAT_INPUT_HEIGHT)}px`;
 }
 
-function onThumbsUp() {
-	emit('thumbsUp');
+function onRateMessage(feedback: RatingFeedback) {
+	emit('feedback', feedback);
 }
 
-function onThumbsDown() {
-	emit('thumbsDown');
+function scrollToBottom() {
+	if (messagesRef.value) {
+		messagesRef.value?.scrollTo({
+			top: messagesRef.value.scrollHeight,
+			behavior: 'smooth',
+		});
+	}
 }
-
-function onSubmitFeedback(feedback: string) {
-	emit('submitFeedback', feedback);
-}
+watch(sendDisabled, () => {
+	chatInput.value?.focus();
+});
+watch(
+	() => props.messages,
+	async (messages) => {
+		// Check if the last message is user and scroll to bottom of the chat
+		if (props.scrollOnNewMessage && messages.length > 0) {
+			// Wait for DOM updates before scrolling
+			await nextTick();
+			// Check if messagesRef is available after nextTick
+			if (messagesRef.value) {
+				scrollToBottom();
+			}
+		}
+	},
+	{ immediate: true, deep: true },
+);
 </script>
 
 <template>
@@ -129,85 +227,28 @@ function onSubmitFeedback(feedback: string) {
 			</div>
 		</div>
 		<div :class="$style.body">
-			<div v-if="messages?.length || loadingMessage" :class="$style.messages">
-				<div v-if="messages?.length">
+			<div
+				v-if="normalizedMessages?.length || loadingMessage"
+				ref="messagesRef"
+				:class="$style.messages"
+			>
+				<div v-if="normalizedMessages?.length">
 					<data
-						v-for="(message, i) in messages"
-						:key="i"
+						v-for="(message, i) in normalizedMessages"
+						:key="message.id"
 						:data-test-id="
 							message.role === 'assistant' ? 'chat-message-assistant' : 'chat-message-user'
 						"
 					>
-						<TextMessage
-							v-if="message.type === 'text'"
+						<MessageWrapper
 							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
+							:is-first-of-role="i === 0 || message.role !== normalizedMessages[i - 1].role"
 							:user="user"
 							:streaming="streaming"
-							:is-last-message="i === messages.length - 1"
-						/>
-						<BlockMessage
-							v-else-if="message.type === 'block'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-							:streaming="streaming"
-							:is-last-message="i === messages.length - 1"
-						/>
-						<ErrorMessage
-							v-else-if="message.type === 'error'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-						/>
-						<EventMessage
-							v-else-if="message.type === 'event'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-						/>
-						<CodeDiffMessage
-							v-else-if="message.type === 'code-diff'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-							:streaming="streaming"
-							:is-last-message="i === messages.length - 1"
+							:is-last-message="i === normalizedMessages.length - 1"
 							@code-replace="() => emit('codeReplace', i)"
 							@code-undo="() => emit('codeUndo', i)"
-						/>
-						<WorkflowStepsMessage
-							v-else-if="message.type === 'workflow-step'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-						/>
-						<WorkflowNodesMessage
-							v-else-if="message.type === 'workflow-node'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-						/>
-						<ComposedNodesMessage
-							v-else-if="message.type === 'workflow-composed'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-						/>
-						<WorkflowGeneratedMessage
-							v-else-if="message.type === 'workflow-generated'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-						/>
-						<RateWorkflowMessage
-							v-else-if="message.type === 'rate-workflow'"
-							:message="message"
-							:is-first-of-role="i === 0 || message.role !== messages[i - 1].role"
-							:user="user"
-							@thumbs-up="onThumbsUp"
-							@thumbs-down="onThumbsDown"
-							@submit-feedback="onSubmitFeedback"
+							@feedback="onRateMessage"
 						/>
 
 						<div
@@ -215,7 +256,7 @@ function onSubmitFeedback(feedback: string) {
 								!streaming &&
 								'quickReplies' in message &&
 								message.quickReplies?.length &&
-								i === messages.length - 1
+								i === normalizedMessages.length - 1
 							"
 							:class="$style.quickReplies"
 						>
@@ -237,7 +278,7 @@ function onSubmitFeedback(feedback: string) {
 				</div>
 				<div
 					v-if="loadingMessage"
-					:class="{ [$style.message]: true, [$style.loading]: messages?.length }"
+					:class="{ [$style.message]: true, [$style.loading]: normalizedMessages?.length }"
 				>
 					<AssistantLoadingMessage :message="loadingMessage" />
 				</div>
@@ -285,16 +326,30 @@ function onSubmitFeedback(feedback: string) {
 					:placeholder="placeholder ?? t('assistantChat.inputPlaceholder')"
 					rows="1"
 					wrap="hard"
+					:maxlength="maxLength"
 					data-test-id="chat-input"
 					@keydown.enter.exact.prevent="onSendMessage"
 					@input.prevent="growInput"
 					@keydown.stop
 				/>
-				<N8nIconButton
-					:class="{ [$style.sendButton]: true }"
+				<N8nButton
+					v-if="showStop && streaming"
+					:class="$style.stopButton"
+					icon="square"
+					size="large"
+					type="danger"
+					outline
+					square
+					data-test-id="send-message-button"
+					@click="emit('stop')"
+				/>
+				<N8nButton
+					v-else
+					:class="$style.sendButton"
 					icon="send"
 					:text="true"
 					size="large"
+					square
 					data-test-id="send-message-button"
 					:disabled="sendDisabled"
 					@click="onSendMessage"
@@ -311,7 +366,9 @@ function onSubmitFeedback(feedback: string) {
 	display: grid;
 	grid-template-rows: auto 1fr auto;
 }
-
+:root .stopButton {
+	--button-border-color: transparent;
+}
 .header {
 	height: 65px; // same as header height in editor
 	padding: 0 var(--spacing-l);
@@ -354,6 +411,20 @@ function onSubmitFeedback(feedback: string) {
 	height: 100%;
 	padding: var(--spacing-xs);
 	overflow-y: auto;
+
+	@supports not (selector(::-webkit-scrollbar)) {
+		scrollbar-width: thin;
+	}
+	@supports selector(::-webkit-scrollbar) {
+		&::-webkit-scrollbar {
+			width: var(--spacing-2xs);
+		}
+		&::-webkit-scrollbar-thumb {
+			border-radius: var(--spacing-xs);
+			background: var(--color-foreground-dark);
+			border: var(--spacing-5xs) solid white;
+		}
+	}
 
 	& + & {
 		padding-top: 0;
