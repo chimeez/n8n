@@ -1,3 +1,6 @@
+on:
+  workflow_dispatch:
+
 name: Destroy Benchmark Env
 
 on:
