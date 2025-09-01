@@ -1,3 +1,6 @@
+on:
+  workflow_dispatch:
+
 name: Test Workflows - Reusable
 
 on:
