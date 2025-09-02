@@ -1,10 +1,8 @@
-on:
-  workflow_dispatch:
-
 name: Test Workflows - Reusable
 
 on:
-  workflow_call:
+  workflow_dispatch:   # manual trigger
+  workflow_call:       # allows other workflows to call this one
     inputs:
       git_ref:
         description: 'The Git ref (branch, tag, or SHA) to checkout and test.'
