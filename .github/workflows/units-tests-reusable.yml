@@ -1,10 +1,8 @@
-on:
-  workflow_dispatch:
-
 name: Reusable units test workflow
 
 on:
-  workflow_call:
+  workflow_dispatch:   # lets you trigger manually
+  workflow_call:       # lets other workflows call it
     inputs:
       ref:
         description: GitHub ref to test.
