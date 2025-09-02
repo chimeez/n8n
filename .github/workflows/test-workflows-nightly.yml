@@ -1,11 +1,6 @@
-on:
-  workflow_dispatch:
-
 name: Test Workflows Nightly and Manual
 
 on:
-  schedule:
-    - cron: '0 2 * * *'
   workflow_dispatch:
     inputs:
       git_ref_to_test:
