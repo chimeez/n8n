@@ -1,12 +1,9 @@
-on:
-  workflow_dispatch:
-
 name: Destroy Benchmark Env
 
 on:
-  schedule:
+  workflow_dispatch:   # manual run
+  schedule:            # scheduled run
     - cron: '0 5 * * *'
-  workflow_dispatch:
 
 permissions:
   id-token: write
