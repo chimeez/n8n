@@ -1,11 +1,8 @@
-on:
-  workflow_dispatch:
-
 name: Benchmark Docker Image CI
 
 on:
-  workflow_dispatch:
-  push:
+  workflow_dispatch:   # manual trigger
+  push:                # auto trigger when these paths change on master
     branches:
       - master
     paths:
