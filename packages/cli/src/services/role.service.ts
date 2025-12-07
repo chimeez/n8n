@@ -1,3 +1,5 @@
+import { CreateRoleDto, UpdateRoleDto } from '@n8n/api-types';
+import { LicenseState } from '@n8n/backend-common';
 import {
 	CredentialsEntity,
 	SharedCredentials,
@@ -10,47 +12,71 @@ import {
 	Role,
 	Scope as DBScope,
 	ScopeRepository,
+	GLOBAL_ADMIN_ROLE,
 } from '@n8n/db';
 import { Service } from '@n8n/di';
-import type { CustomRole, ProjectRole, Scope, Role as RoleDTO } from '@n8n/permissions';
+import type {
+	Scope,
+	Role as RoleDTO,
+	AssignableProjectRole,
+	RoleNamespace,
+} from '@n8n/permissions';
 import {
 	combineScopes,
 	getAuthPrincipalScopes,
 	getRoleScopes,
 	isBuiltInRole,
+	PROJECT_ADMIN_ROLE_SLUG,
+	PROJECT_EDITOR_ROLE_SLUG,
+	PROJECT_VIEWER_ROLE_SLUG,
 } from '@n8n/permissions';
 import { UnexpectedError, UserError } from 'n8n-workflow';
 
-import { License } from '@/license';
-import { CreateRoleDto, UpdateRoleDto } from '@n8n/api-types';
-import { NotFoundError } from '@/errors/response-errors/not-found.error';
 import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+import { NotFoundError } from '@/errors/response-errors/not-found.error';
+import { RoleCacheService } from './role-cache.service';
+import { isUniqueConstraintError } from '@/response-helper';
 
 @Service()
 export class RoleService {
 	constructor(
-		private readonly license: License,
+		private readonly license: LicenseState,
 		private readonly roleRepository: RoleRepository,
 		private readonly scopeRepository: ScopeRepository,
+		private readonly roleCacheService: RoleCacheService,
 	) {}
 
-	private dbRoleToRoleDTO(role: Role): RoleDTO {
+	private dbRoleToRoleDTO(role: Role, usedByUsers?: number): RoleDTO {
 		return {
 			...role,
 			scopes: role.scopes.map((s) => s.slug),
 			licensed: this.isRoleLicensed(role.slug),
+			usedByUsers,
 		};
 	}
 
-	async getAllRoles(): Promise<RoleDTO[]> {
+	async getAllRoles(withCount: boolean = false): Promise<RoleDTO[]> {
 		const roles = await this.roleRepository.findAll();
-		return roles.map((r) => this.dbRoleToRoleDTO(r));
+
+		if (!withCount) {
+			return roles.map((r) => this.dbRoleToRoleDTO(r));
+		}
+
+		const roleCounts = await this.roleRepository.findAllRoleCounts();
+
+		return roles.map((role) => {
+			const usedByUsers = roleCounts[role.slug] ?? 0;
+			return this.dbRoleToRoleDTO(role, usedByUsers);
+		});
 	}
 
-	async getRole(slug: string): Promise<RoleDTO> {
+	async getRole(slug: string, withCount: boolean = false): Promise<RoleDTO> {
 		const role = await this.roleRepository.findBySlug(slug);
 		if (role) {
-			return this.dbRoleToRoleDTO(role);
+			const usedByUsers = withCount
+				? await this.roleRepository.countUsersWithRole(role)
+				: undefined;
+			return this.dbRoleToRoleDTO(role, usedByUsers);
 		}
 		throw new NotFoundError('Role not found');
 	}
@@ -63,7 +89,18 @@ export class RoleService {
 		if (role.systemRole) {
 			throw new BadRequestError('Cannot delete system roles');
 		}
+
+		// Check if any users is globally or project assigned to the role
+		const usersWithRole = await this.roleRepository.countUsersWithRole(role);
+		if (usersWithRole > 0) {
+			throw new BadRequestError('Cannot delete role assigned to users');
+		}
+
 		await this.roleRepository.removeBySlug(slug);
+
+		// Invalidate cache after role deletion
+		await this.roleCacheService.invalidateCache();
+
 		return this.dbRoleToRoleDTO(role);
 	}
 
@@ -95,6 +132,9 @@ export class RoleService {
 				scopes: await this.resolveScopes(scopeSlugs),
 			});
 
+			// Invalidate cache after role update
+			await this.roleCacheService.invalidateCache();
+
 			return this.dbRoleToRoleDTO(updatedRole);
 		} catch (error) {
 			if (error instanceof UserError && error.message === 'Role not found') {
@@ -104,6 +144,11 @@ export class RoleService {
 			if (error instanceof UserError && error.message === 'Cannot update system roles') {
 				throw new BadRequestError('Cannot update system roles');
 			}
+
+			if (error instanceof Error && isUniqueConstraintError(error)) {
+				throw new BadRequestError(`A role with the name "${displayName}" already exists`);
+			}
+
 			throw error;
 		}
 	}
@@ -120,8 +165,39 @@ export class RoleService {
 		role.systemRole = false;
 		role.roleType = newRole.roleType;
 		role.slug = `${newRole.roleType}:${newRole.displayName.toLowerCase().replace(/[^a-z0-9]+/g, '-')}-${Math.random().toString(36).substring(2, 8)}`;
-		const createdRole = await this.roleRepository.save(role);
-		return this.dbRoleToRoleDTO(createdRole);
+
+		try {
+			const createdRole = await this.roleRepository.save(role);
+
+			// Invalidate cache after role creation
+			await this.roleCacheService.invalidateCache();
+
+			return this.dbRoleToRoleDTO(createdRole);
+		} catch (error) {
+			if (error instanceof Error && isUniqueConstraintError(error)) {
+				throw new BadRequestError(`A role with the name "${newRole.displayName}" already exists`);
+			}
+			throw error;
+		}
+	}
+
+	async checkRolesExist(
+		roleSlugs: string[],
+		roleType: 'global' | 'project' | 'workflow' | 'credential',
+	) {
+		const uniqueRoleSlugs = new Set(roleSlugs);
+		const roles = await this.roleRepository.findBySlugs(Array.from(uniqueRoleSlugs), roleType);
+
+		if (roles.length < uniqueRoleSlugs.size) {
+			const nonExistentRoles = Array.from(uniqueRoleSlugs).filter(
+				(slug) => !roles.find((role) => role.slug === slug),
+			);
+			throw new BadRequestError(
+				nonExistentRoles.length === 1
+					? `Role ${nonExistentRoles[0]} does not exist`
+					: `Roles ${nonExistentRoles.join(', ')} do not exist`,
+			);
+		}
 	}
 
 	addScopes(
@@ -170,12 +246,17 @@ export class RoleService {
 			throw new UnexpectedError('Cannot detect if entity is a workflow or credential.');
 		}
 
-		entity.scopes = this.combineResourceScopes(
-			'active' in entity ? 'workflow' : 'credential',
-			user,
-			shared,
-			userProjectRelations,
-		);
+		const entityType = 'active' in entity ? 'workflow' : 'credential';
+		entity.scopes = this.combineResourceScopes(entityType, user, shared, userProjectRelations);
+
+		if (
+			entityType === 'credential' &&
+			'isGlobal' in entity &&
+			entity.isGlobal &&
+			!entity.scopes.includes('credential:read')
+		) {
+			entity.scopes.push('credential:read');
+		}
 
 		return entity;
 	}
@@ -209,24 +290,35 @@ export class RoleService {
 		return [...scopesSet].sort();
 	}
 
-	isRoleLicensed(role: ProjectRole | CustomRole) {
+	/**
+	 * Enhanced rolesWithScope function that combines static roles with database roles
+	 * This replaces the original rolesWithScope function from @n8n/permissions
+	 */
+	async rolesWithScope(namespace: RoleNamespace, scopes: Scope | Scope[]): Promise<string[]> {
+		if (!Array.isArray(scopes)) {
+			scopes = [scopes];
+		}
+		// Get database roles from cache
+		return await this.roleCacheService.getRolesWithAllScopes(namespace, scopes);
+	}
+
+	isRoleLicensed(role: AssignableProjectRole) {
 		// TODO: move this info into FrontendSettings
 
 		if (!isBuiltInRole(role)) {
 			// This is a custom role, there for we need to check if
 			// custom roles are licensed
-			// TODO: add license check for custom roles
-			return true;
+			return this.license.isCustomRolesLicensed();
 		}
 
 		switch (role) {
-			case 'project:admin':
+			case PROJECT_ADMIN_ROLE_SLUG:
 				return this.license.isProjectRoleAdminLicensed();
-			case 'project:editor':
+			case PROJECT_EDITOR_ROLE_SLUG:
 				return this.license.isProjectRoleEditorLicensed();
-			case 'project:viewer':
+			case PROJECT_VIEWER_ROLE_SLUG:
 				return this.license.isProjectRoleViewerLicensed();
-			case 'global:admin':
+			case GLOBAL_ADMIN_ROLE.slug:
 				return this.license.isAdvancedPermissionsLicensed();
 			default:
 				// TODO: handle custom roles licensing

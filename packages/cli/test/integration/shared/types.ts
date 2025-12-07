@@ -43,10 +43,12 @@ type EndpointGroup =
 	| 'ai'
 	| 'folder'
 	| 'insights'
+	| 'module-settings'
 	| 'data-table'
-	| 'module-settings';
+	| 'third-party-licenses'
+	| 'mcp';
 
-type ModuleName = 'insights' | 'external-secrets' | 'community-packages' | 'data-table';
+type ModuleName = 'insights' | 'external-secrets' | 'community-packages' | 'data-table' | 'mcp';
 
 export interface SetupProps {
 	endpointGroups?: EndpointGroup[];
